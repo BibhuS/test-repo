@@ -1,0 +1,749 @@
+Absolutely. Let's lock down the final design and walk through exactly what happens, including the edge cases we discussed.
+
+One terminology point first: you called it variables.py, but from your screenshots this is your variables.yml file. I'll use variables.yml below.
+
+1. The three files have three different responsibilities
+databricks.yml
+       │
+       │  Which environment am I deploying?
+       │
+       ▼
+variables.yml
+       │
+       │  What schedules/pause rules should apply?
+       │
+       ▼
+schedules.py
+       │
+       │  Apply those rules to every job
+       ▼
+Databricks Jobs
+databricks.yml
+
+Responsible for:
+
+DEV target
+TEST target
+PROD target
+workspace
+catalog
+environment
+other deployment-specific configuration
+
+It does not contain individual job schedules or pause settings.
+
+variables.yml
+
+Responsible for:
+
+Existing job schedules
+Environment scheduling defaults
+Per-job overrides
+
+This becomes your scheduling configuration.
+
+schedules.py
+
+Responsible for the decision-making.
+
+It looks at:
+
+Which target am I deploying?
+What is the default pause state for that environment?
+Does this particular job have an override?
+If yes, apply the override.
+If no, use the default.
+2. databricks.yml
+
+The important part is simply:
+
+targets:
+
+  dev:
+    mode: production
+    variables:
+      environment: "dev"
+
+  test:
+    mode: production
+    variables:
+      environment: "test"
+
+  prod:
+    mode: production
+    variables:
+      environment: "prod"
+
+You already have other variables here such as catalog, seal, workspace, etc.
+
+Keep those.
+
+The important change is:
+
+NO schedule_pause_status here
+NO individual job schedules here
+NO job-specific scheduling logic here
+
+The target tells the mutator:
+
+bundle.target = dev
+bundle.target = test
+bundle.target = prod
+
+That's all we need from databricks.yml for scheduling.
+
+3. variables.yml
+
+This has two concepts.
+
+A. Existing schedules
+
+You already have something like:
+
+datahub_silver_load_schedule:
+  default: "0 0 8 * * ?"
+
+job_02_schedule:
+  default: "0 15 10 * * ?"
+
+job_03_schedule:
+  default: "0 30 12 * * ?"
+
+These remain.
+
+These are essentially your existing PROD/default schedules.
+
+We don't want to destroy that because PROD is already working.
+
+4. Environment default pause status
+
+Now we introduce the environment defaults.
+
+For example:
+
+dev_schedule_pause_status:
+  default: "PAUSED"
+
+test_schedule_pause_status:
+  default: "PAUSED"
+
+prod_schedule_pause_status:
+  default: "UNPAUSED"
+
+This means:
+
+DEV
+Default = PAUSED
+TEST
+Default = PAUSED
+PROD
+Default = UNPAUSED
+
+But remember: DEV and TEST are not permanently required to be PAUSED.
+
+You can change the defaults later.
+
+For example:
+
+dev_schedule_pause_status:
+  default: "UNPAUSED"
+
+would make every Dev job unpaused unless there is a job-specific override saying otherwise.
+
+5. Per-job overrides
+
+Now comes the important part.
+
+We have a structured configuration such as:
+
+schedule_overrides:
+  dev:
+    job_01:
+      cron: "0 0 9 * * ?"
+      pause_status: "UNPAUSED"
+
+    job_02:
+      cron: "0 15 10 * * ?"
+      pause_status: "UNPAUSED"
+
+  test:
+    job_01:
+      cron: "0 0 12 * * ?"
+      pause_status: "UNPAUSED"
+
+    job_05:
+      cron: "0 30 14 * * ?"
+      pause_status: "UNPAUSED"
+
+  prod: {}
+
+The important thing is:
+
+This list is not fixed.
+
+It could contain:
+
+10 jobs today
+15 jobs next month
+5 jobs later
+
+There is no hard-coded number.
+
+6. How a normal deployment works
+
+Let's say you run:
+
+databricks bundle deploy -t dev
+
+The bundle target is:
+
+dev
+
+The mutator gets:
+
+bundle.target = dev
+
+It then gets the DEV default:
+
+dev_schedule_pause_status = PAUSED
+
+Then it processes every job.
+
+7. Job with an override
+
+Suppose:
+
+schedule_overrides:
+  dev:
+
+    datahub_silver_load:
+      cron: "0 0 9 * * ?"
+      pause_status: "UNPAUSED"
+
+When the mutator reaches:
+
+datahub_silver_load
+
+it finds an override.
+
+Therefore:
+
+Default:
+PAUSED
+
+Override:
+UNPAUSED
+cron = 09:00
+
+Final job:
+
+UNPAUSED
+09:00
+8. Job without an override
+
+Suppose Job 20 isn't listed.
+
+The mutator checks:
+
+Is Job 20 in dev overrides?
+
+Answer:
+
+NO
+
+Therefore it uses:
+
+DEV default = PAUSED
+
+Final:
+
+Job 20 → PAUSED
+
+So if you have 40 jobs and only 10 are listed:
+
+10 listed jobs
+     ↓
+UNPAUSED + individual schedule
+
+30 unlisted jobs
+     ↓
+PAUSED
+
+Again, 10 is not hard-coded.
+
+9. What happens if you want 15 jobs running later?
+
+Simply change the configuration.
+
+Add five more jobs:
+
+schedule_overrides:
+  dev:
+
+    job_01:
+      cron: "..."
+      pause_status: "UNPAUSED"
+
+    job_02:
+      cron: "..."
+      pause_status: "UNPAUSED"
+
+    # ...
+
+    job_15:
+      cron: "..."
+      pause_status: "UNPAUSED"
+
+Now:
+
+15 → UNPAUSED
+25 → PAUSED
+
+No Python change.
+
+No job YAML change.
+
+No databricks.yml change.
+
+10. What if a running job needs to be paused?
+
+Remove its override, if the environment default is PAUSED.
+
+For example, currently:
+
+job_07:
+  cron: "0 0 10 * * ?"
+  pause_status: "UNPAUSED"
+
+Remove job_07.
+
+Then:
+
+job_07
+ ↓
+no override
+ ↓
+DEV default = PAUSED
+ ↓
+PAUSED
+
+Again, no code change.
+
+11. What if you want to keep the job override but pause it?
+
+You can explicitly say:
+
+job_07:
+  cron: "0 0 10 * * ?"
+  pause_status: "PAUSED"
+
+Then it is paused.
+
+This is useful if you want the job's schedule configuration to remain documented even while the job is temporarily paused.
+
+12. What if the schedule changes?
+
+Suppose:
+
+job_07:
+  cron: "0 0 10 * * ?"
+  pause_status: "UNPAUSED"
+
+Later:
+
+job_07:
+  cron: "0 0 14 * * ?"
+  pause_status: "UNPAUSED"
+
+After deployment:
+
+Job 07
+10:00 → 14:00
+
+No job YAML modification.
+
+13. What if only pause status changes?
+
+For example:
+
+job_07:
+  pause_status: "PAUSED"
+
+If the mutator supports partial overrides as we designed, the existing schedule remains and only the pause state changes.
+
+So:
+
+cron → unchanged
+pause → PAUSED
+
+This is useful because schedule and pause are independent properties.
+
+14. What if only the schedule changes?
+
+Similarly:
+
+job_07:
+  cron: "0 0 16 * * ?"
+
+The mutator can keep the applicable pause state and only change the cron.
+
+So:
+
+pause → unchanged
+cron → 16:00
+15. What if you want to pause ALL DEV jobs?
+
+This is where the default is powerful.
+
+Set:
+
+dev_schedule_pause_status:
+  default: "PAUSED"
+
+and don't have any UNPAUSED overrides.
+
+Result:
+
+Job 1  → PAUSED
+Job 2  → PAUSED
+Job 3  → PAUSED
+...
+Job 40 → PAUSED
+
+You don't need to list 40 jobs.
+
+16. What if you want ALL DEV jobs unpaused?
+
+Change:
+
+dev_schedule_pause_status:
+  default: "UNPAUSED"
+
+Now every job is unpaused unless you explicitly override one:
+
+job_07:
+  pause_status: "PAUSED"
+
+Result:
+
+39 → UNPAUSED
+Job 07 → PAUSED
+
+So the model works in both directions.
+
+17. What about TEST?
+
+Exactly the same logic, but independently.
+
+For example:
+
+test_schedule_pause_status:
+  default: "PAUSED"
+
+schedule_overrides:
+
+  test:
+
+    job_01:
+      cron: "0 0 8 * * ?"
+      pause_status: "UNPAUSED"
+
+    job_05:
+      cron: "0 0 12 * * ?"
+      pause_status: "UNPAUSED"
+
+Then:
+
+TEST
+
+Job 01 → UNPAUSED + 08:00
+Job 05 → UNPAUSED + 12:00
+Everything else → PAUSED
+
+DEV configuration does not affect TEST.
+
+18. DEV and TEST can have completely different jobs running
+
+For example:
+
+DEV
+ ├── Job 01 → UNPAUSED
+ ├── Job 02 → UNPAUSED
+ ├── Job 03 → PAUSED
+ └── Job 04 → PAUSED
+
+TEST:
+
+TEST
+ ├── Job 01 → PAUSED
+ ├── Job 02 → PAUSED
+ ├── Job 03 → UNPAUSED
+ └── Job 04 → UNPAUSED
+
+Same jobs.
+
+Completely different scheduling policy.
+
+19. DEV and TEST can have different schedules from PROD
+
+Suppose PROD:
+
+Job 01 → 08:00
+
+DEV:
+
+Job 01 → 10:00
+
+TEST:
+
+Job 01 → 14:00
+
+The three deployments can therefore produce:
+
+              Job 01
+                │
+       ┌────────┼────────┐
+       ↓        ↓        ↓
+      PROD     DEV      TEST
+      08:00    10:00    14:00
+
+This is exactly the requirement you originally described.
+
+20. What happens to PROD?
+
+This is especially important because PROD is already working.
+
+We don't want the new functionality to accidentally change PROD.
+
+So the intended logic is:
+
+bundle.target == prod
+        ↓
+existing PROD schedule
+        ↓
+existing PROD pause behavior
+
+And:
+
+prod: {}
+
+means there are no special Dev/Test overrides being applied to PROD.
+
+So your current production schedule variables remain the source for PROD.
+
+21. What if someone accidentally puts a DEV job under TEST?
+
+For example:
+
+schedule_overrides:
+  test:
+    job_999:
+      cron: "..."
+
+The mutator only looks at:
+
+schedule_overrides[test]
+
+when deploying TEST.
+
+It doesn't apply TEST configuration to DEV.
+
+Likewise:
+
+DEV deployment → only DEV overrides
+TEST deployment → only TEST overrides
+PROD deployment → only PROD configuration
+22. What if a job is in the override but the cron is missing?
+
+For example:
+
+job_07:
+  pause_status: "UNPAUSED"
+
+Then the intended behavior is:
+
+pause → UNPAUSED
+cron → retain existing applicable cron
+
+This is useful when you want to change only pause state.
+
+23. What if the pause status is missing?
+
+For example:
+
+job_07:
+  cron: "0 0 14 * * ?"
+
+Then:
+
+cron → 14:00
+pause → environment default
+
+So if DEV default is PAUSED:
+
+Job 07 → PAUSED + 14:00
+
+If DEV default is UNPAUSED:
+
+Job 07 → UNPAUSED + 14:00
+
+This gives you flexibility.
+
+24. What if an override refers to a job that doesn't exist?
+
+This is an edge case we should handle deliberately.
+
+For example:
+
+dev:
+  job_that_does_not_exist:
+    cron: "..."
+
+The mutator should ideally fail validation/deployment with a clear error, rather than silently ignoring it.
+
+Something like:
+
+Schedule override specified for unknown job:
+job_that_does_not_exist
+
+That prevents spelling mistakes from going unnoticed.
+
+25. What if cron is invalid?
+
+Same principle.
+
+If someone enters an invalid Quartz cron expression:
+
+cron: "abc"
+
+the deployment should fail rather than silently deploying a broken schedule.
+
+So validation is important.
+
+26. What if an override has an invalid pause value?
+
+Only allow:
+
+PAUSED
+UNPAUSED
+
+Anything else should be rejected:
+
+pause_status: "STOPPED"
+
+→ validation error.
+
+27. What if there is no override section?
+
+That's fine.
+
+For example:
+
+schedule_overrides:
+  dev: {}
+  test: {}
+  prod: {}
+
+Then the mutator simply applies the environment defaults.
+
+28. The most important precedence rule
+
+This should be explicitly defined in schedules.py.
+
+I recommend:
+
+JOB-SPECIFIC OVERRIDE
+        ↓
+takes priority over
+        ↓
+ENVIRONMENT DEFAULT
+        ↓
+takes priority over
+        ↓
+existing/default behavior
+
+For DEV:
+
+DEV default = PAUSED
+
+Job A override = UNPAUSED
+                   ↓
+              Job A runs
+
+Job B no override
+                   ↓
+              Job B paused
+29. Final decision table
+Environment	Override exists?	Override pause	Result
+DEV	No	—	DEV default
+DEV	Yes	UNPAUSED	UNPAUSED
+DEV	Yes	PAUSED	PAUSED
+TEST	No	—	TEST default
+TEST	Yes	UNPAUSED	UNPAUSED
+TEST	Yes	PAUSED	PAUSED
+PROD	No	—	Existing PROD behavior
+PROD	Yes	Depends	Only if we deliberately support PROD overrides
+
+And for schedules:
+
+Override cron?	Result
+No	Keep existing applicable cron
+Yes	Use override cron
+30. Final picture
+                         databricks.yml
+                              │
+                    ┌─────────┼─────────┐
+                    │         │         │
+                   DEV       TEST      PROD
+                    │         │         │
+                    └─────────┼─────────┘
+                              │
+                              ▼
+                         variables.yml
+                              │
+             ┌────────────────┼────────────────┐
+             │                │                │
+        Existing cron    Environment       Job overrides
+                         defaults
+             │                │                │
+             │          DEV → PAUSED          │
+             │          TEST → PAUSED         │
+             │          PROD → existing       │
+             │                                │
+             └────────────────┬───────────────┘
+                              ▼
+                         schedules.py
+                           mutator
+                              │
+                 ┌────────────┴────────────┐
+                 │                         │
+          Override exists            No override
+                 │                         │
+                 ▼                         ▼
+          Use job-specific          Use environment
+          cron/pause                 default
+                 │                         │
+                 └────────────┬────────────┘
+                              ▼
+                       Databricks Jobs
+The core idea
+
+The solution is not:
+
+"10 jobs are unpaused."
+
+It is:
+
+"Every environment has a default state, and any job can be an exception."
+
+That means your configuration remains flexible whether you have:
+
+40 jobs → 10 running
+40 jobs → 20 running
+40 jobs → 2 running
+1,000 jobs → 100 running
+1,000 jobs → 50 running
+
+You simply change variables.yml; schedules.py doesn't need to change.
+
+One implementation point I would keep strict: the exact syntax/API for reading a complex DAB variable in your existing schedules.py needs to match the Databricks Bundles/Python version in your repository. The architecture and precedence above are the design; that API detail should be taken from your existing working mutator rather than guessed.
